@@ -1,5 +1,5 @@
 def takeS(i, xs):
-    ys = [x for (j, x) in xs if j < i]
+    ys = [x for (j, x) in enumerate(xs) if j < i]
     return ys
 
 #  unpackStream py :: unpack => "iterator" a -> [a]
