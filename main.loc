@@ -1,13 +1,12 @@
-module stream
-
-export Stream
-export takeS
+module stream (*)
 
 source Py from "stream.py"
   ( "packStream"
   , "unpackStream"
   , "takeS"
   )
+
+type Py (Stream a) = "iterator" a
 
 packStream   :: pack   => [a] -> Stream a
 unpackStream :: unpack => Stream a -> [a]
