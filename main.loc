@@ -1,5 +1,7 @@
 module stream (*)
 
+import types
+
 source Py from "stream.py"
   ( "packStream"
   , "unpackStream"
@@ -8,12 +10,8 @@ source Py from "stream.py"
 
 type Py => (Stream a) = "iterator" a
 
-packStream   :: pack   => [a] -> Stream a
-unpackStream :: unpack => Stream a -> [a]
-
-packStream   Py :: pack   => [a] -> "iterator" a
-unpackStream Py :: unpack => "iterator" a -> [a]
+instance Packable [a] (Stream a) where
+  source Py from "stream.py" ( "packStream" as pack, "unpackStream" as unpack)
 
 -- mutates the Stream input
 takeS :: Int -> Stream a -> [a]
-takeS py :: "int" -> "iterator" a -> [a]
