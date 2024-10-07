@@ -9,4 +9,4 @@ author: "Zebulun Arendsee"
 maintainer: "zbwrnz@gmail.com"
 github: https://github.com/morloclib/stream
 bug-reports: https://github.com/morloclib/stream
-gcc-flags: "c++17"
+cpp-version: 17
