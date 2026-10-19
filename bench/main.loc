@@ -1,0 +1,50 @@
+--' Benchmarks of stream ingest against a native C++ program
+--'
+--' `ingestFa` reads FASTA with the parser native.cpp uses and writes a morloc
+--' stream file through `ingest`; `countFa` reads one back.
+module stream-bench (ingestFa, countFa)
+
+import root-cpp
+import stream
+import stream-cpp
+
+--' One FASTA entry
+record FaEntry where
+  --' Header line without the '>'
+  header :: Str
+  --' Sequence
+  bases :: Str
+
+record Cpp => FaEntry = "BenchFa"
+
+source Cpp from "fasta.hpp"
+  ( "bench_read_fasta" as readFa
+  , "bench_count_batch" as countBatch
+  )
+
+--' Read a FASTA file, batch by batch
+readFa :: Reader FaEntry
+
+--' Convert a FASTA file into a morloc stream file
+ingestFa ::
+  CompressionLevel ->
+  --' FASTA file
+  --' @check.path r
+  Str ->
+  --' Output stream file
+  --' @check.path w
+  Str ->
+  <IO> ()
+ingestFa level input output = ingest readFa level input output
+
+--' The number of entries and bases in a stream file of entries
+countFa ::
+  --' Stream file
+  --' @check.path r
+  Str ->
+  <IO> (Int, Int)
+countFa path = foldSource countBatch (0, 0) (loadSource path)
+
+-- Entries and bases so far, plus those of a batch
+countBatch :: (Int, Int) -> [FaEntry] -> (Int, Int)
+

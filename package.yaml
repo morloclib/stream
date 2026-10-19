@@ -1,12 +1,11 @@
-name: stream 
-version: 0.0.0
-homepage: https://github.com/morloclib/stream
-synopsis: Core functions for stream processing
-description: A stub for stream processing
-category: basic
+name: stream
+version: 0.1.0
+homepage: null
+synopsis: Push streams, pull streams and statistics over them
+description: Push sources for text readers, morloc stream files, and runstat, a one-pass statistic over a pull built from a batch summary, an associative merge and a final cleanup. Implementations are stream-rust and stream-py.
+category: data
 license: MIT
 author: "Zebulun Arendsee"
-maintainer: "zbwrnz@gmail.com"
-github: https://github.com/morloclib/stream
-bug-reports: https://github.com/morloclib/stream
-cpp-version: 17
+maintainer: "z@morloc.io"
+github: null
+bug-reports: null

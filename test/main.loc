@@ -1,0 +1,245 @@
+--' The stream test suite
+--'
+--' It runs against whichever implementation module is imported alongside it.
+module stream.test (test, knownIssues)
+
+import root
+import stream
+import shell (rm)
+import bioutil (mapE_)
+import unittest
+
+source Py from "stream-test.py"
+  ( "tmp_path" as tmpPath
+  , "truncate_file" as truncateFile
+  , "tmp_dir" as tmpDir
+  , "files_in" as filesIn
+  , "scrambled" as scrambled
+  , "sorted_records" as sortedRecords
+  , "pieces" as pieces
+  )
+
+--' A fresh directory
+tmpDir :: Str -> <IO> Str
+
+--' How many entries a directory holds
+filesIn :: Str -> <IO> Int
+
+--' Records of `width` words, with repeats, over the U64 range
+scrambled :: Int -> Int -> Int -> [U64]
+
+--' Records of `width` words sorted as the sorter sorts them
+sortedRecords :: [U64] -> Int -> [U64]
+
+--' A list cut into pieces of k
+pieces :: Int -> [U64] -> [[U64]]
+
+--' A path in a fresh temporary directory
+tmpPath :: Str -> <IO> Str
+
+--' Cut bytes off the end of a file
+truncateFile :: Str -> Int -> <IO> ()
+
+numbers :: Source Int
+numbers sink = concatSources [listSource [1, 2, 3], listSource [4, 5], listSource noInts, listSource [6]] sink
+
+noInts :: [Int]
+noInts = []
+
+sumBatch :: [Int] -> Int
+sumBatch xs = sum xs
+
+addInts :: Int -> Int -> Int
+addInts a b = a + b
+
+same :: a -> a
+same x = x
+
+-- A mean keeps (total, count) and drops the count when it finishes.
+meanSummary :: [Int] -> (Int, Int)
+meanSummary xs = (sum xs, length xs)
+
+addPairs :: (Int, Int) -> (Int, Int) -> (Int, Int)
+addPairs a b = (.0 a + .0 b, .1 a + .1 b)
+
+meanOf :: (Int, Int) -> Real
+meanOf x = ? .1 x == 0 = 0.0 : toReal (.0 x) / toReal (.1 x)
+
+-- Order matters: this merge is associative but not commutative.
+appendInts :: [Int] -> [Int] -> [Int]
+appendInts a b = a <> b
+
+-- Deletes a file; a missing file is not an error.
+removeFile :: Str -> <IO> ()
+removeFile p = rm {recursive = False, force = True} p
+
+-- Adds a batch's sum after an effect.
+countBatch :: Int -> [Int] -> <IO> Int
+countBatch n xs = do
+  removeFile "/nonexistent/stream-test"
+  n + sum xs
+
+okOr :: a -> Try Str a -> a
+okOr d r = match r
+  | (Ok x) = x
+  | (Err _) = d
+
+isErr :: Try Str a -> Bool
+isErr r = match r
+  | (Err _) = True
+  | (Ok _) = False
+
+testPush :: Results -> <IO> Results
+testPush s0 = do
+  xs <- collectSource numbers
+  total <- foldSource (\n ys -> n + sum ys) 0 numbers
+  doubled <- collectSource (mapSource (map (\x -> x * 2)) numbers)
+  eff <- foldSourceE countBatch 0 numbers
+  ( testEqual "collectSource keeps order across concatenated sources" xs [1, 2, 3, 4, 5, 6]
+  . testEqual "foldSource sums every batch" total 21
+  . testEqual "mapSource transforms each batch" doubled [2, 4, 6, 8, 10, 12]
+  . testEqual "foldSourceE folds with an effectful step" eff 21
+  ) s0
+
+testFiles :: Results -> <IO> Results
+testFiles s0 = do
+  p <- tmpPath "numbers.mlc"
+  saveSource 3 p numbers
+  back <- collectSource (loadSource p)
+  q <- tmpPath "empty.mlc"
+  saveSource 0 q (listSource noInts)
+  none <- collectSource (loadSource q)
+  Ok s1 <- @open p
+  Ok head4 <- takePull 4 (@next s1)
+  Ok s2 <- @open p
+  Ok head9 <- takePull 9 (@next s2)
+  Ok s3 <- @open p
+  pulled <- collectSource (pullSource (@next s3))
+  removeFile q
+  removeFile q
+  gone <- collectSource (loadSource p)
+  ( testEqual "a zstd stream file reads back in order" back [1, 2, 3, 4, 5, 6]
+  . testEqual "takePull takes the first elements across batches" head4 [1, 2, 3, 4]
+  . testEqual "takePull of more than there is takes everything" head9 [1, 2, 3, 4, 5, 6]
+  . testEqual "pullSource feeds every batch of a pull in order" pulled [1, 2, 3, 4, 5, 6]
+  . testEqual "removing a file twice is not an error" gone [1, 2, 3, 4, 5, 6]
+  . testEqual "an empty stream file reads back empty" none noInts
+  ) s0
+
+-- A tag on stored values, as a file format tags what it holds.
+newtype Tagged a = a deriving (Packable)
+
+doubleBatch :: [Int] -> [Int]
+doubleBatch xs = map (\x -> x * 2) xs
+
+testFormats :: Results -> <IO> Results
+testFormats s0 = do
+  p <- tmpPath "formats.mlc"
+  saveSource 0 p numbers
+  q <- tmpPath "copy.mlc"
+  ingest (loadSource :: Reader Int) 3 p q
+  copied <- collectSource (loadSource q)
+  r <- tmpPath "doubled.mlc"
+  convert (mapReader doubleBatch loadSource) (saveSource 0) p r
+  doubled <- collectSource (loadSource r)
+  t <- tmpPath "halved.mlc"
+  emit (comapWriter doubleBatch (saveSource 0)) p t
+  written <- collectSource (loadSource t)
+  u <- tmpPath "tagged.mlc"
+  convert (unpackReader (loadSource :: Reader (Tagged Int))) (packWriter (saveSource 0 :: Writer (Tagged Int))) p u
+  untagged <- collectSource (loadSource u)
+  v <- tmpPath "pulled.mlc"
+  Ok sp <- (@open p :: <IO> (Try Str (IStream Int)))
+  savePull 1 v (@next sp)
+  pulled <- collectSource (loadSource v)
+  ( testEqual "ingest copies a stream file" copied [1, 2, 3, 4, 5, 6]
+  . testEqual "mapReader transforms each batch read" doubled [2, 4, 6, 8, 10, 12]
+  . testEqual "comapWriter transforms each batch written" written [2, 4, 6, 8, 10, 12]
+  . testEqual "a tagged reader and writer carry the untagged values" untagged [1, 2, 3, 4, 5, 6]
+  . testEqual "savePull saves every batch of a pull" pulled [1, 2, 3, 4, 5, 6]
+  ) s0
+
+testReduce :: Results -> <IO> Results
+testReduce s0 = do
+  p <- tmpPath "stat.mlc"
+  saveSource 0 p numbers
+  Ok s1 <- @open p
+  total <- reduce sumBatch addInts same (@next s1)
+  Ok s2 <- @open p
+  mean <- reduce meanSummary addPairs meanOf (@next s2)
+  Ok s3 <- @open p
+  final <- reduce same appendInts same (@next s3)
+  Ok s4 <- @open p
+  both <- reduce2 sumBatch addInts same meanSummary addPairs meanOf (@next s4)
+  r <- tmpPath "many.mlc"
+  saveSource 0 r (listSource (range 1 1000))
+  Ok s12 <- @open r
+  manyRun <- reduce same appendInts same (@next s12)
+  Ok s13 <- @open r
+  t <- tmpPath "tee.mlc"
+  Ok o <- @open t
+  teed <- reduce sumBatch addInts same (teePull 3 o (@next s13))
+  @close o
+  teedBack <- collectSource (loadSource t)
+  q <- tmpPath "empty-stat.mlc"
+  saveSource 0 q (listSource noInts)
+  Ok s5 <- @open q
+  emptyMean <- reduce meanSummary addPairs meanOf (@next s5)
+  ( testEqual "reduce sums a stream file" (okOr 0 total) 21
+  . testNear "reduce finish drops the count of a mean" 1.0e-12 (okOr 0.0 mean) 3.5
+  . testEqual "reduce merges batches in stream order" (okOr [] final) [1, 2, 3, 4, 5, 6]
+  . testEqual "reduce keeps order over a long stream" (okOr [] manyRun) (range 1 1000)
+  . testEqual "reduce over a teePull computes the reduction" (okOr 0 teed) 499500
+  . testEqual "teePull saves every batch in order" teedBack (range 1 1000)
+  . testEqual "reduce2 computes two reductions in one pass" (okOr (0, 0.0) both) (21, 3.5)
+  . testNear "reduce of an empty stream finishes the empty summary" 1.0e-12 (okOr 1.0 emptyMean) 0.0
+  ) s0
+
+testSorter :: Results -> <IO> Results
+testSorter s0 = do
+  d <- tmpDir "sort"
+  let xs = scrambled 5000 3 1
+  h1 <- openSorter d 3 1024
+  pushSorter h1 xs
+  Ok inMemory <- takePull 100000000 (nextSorted h1)
+  closeSorter h1
+  h2 <- openSorter d 3 1
+  mapE_ (pushSorter h2) (pieces 30 xs)
+  Ok spilled <- takePull 100000000 (nextSorted h2)
+  left <- filesIn d
+  closeSorter h2
+  h3 <- openSorter d 1 4
+  Ok none <- takePull 10 (nextSorted h3)
+  closeSorter h3
+  gone <- nextSorted h3
+  ( testEqual "a sorter in memory sorts records as unsigned words" inMemory (sortedRecords xs 3)
+  . testEqual "a sorter spilling more runs than it keeps open sorts the same" spilled (sortedRecords xs 3)
+  . testEqual "sort runs leave no files in the directory" left 0
+  . testEqual "an empty sorter reads back empty" none (sortedRecords [] 1)
+  . testTrue "a closed sorter cannot be read" (isErr gone)
+  ) s0
+
+test :: <IO> Bool
+test = suiteE runTests
+
+runTests :: Results -> <IO> Results
+runTests s0 = do
+  s1 <- groupE "Push streams" testPush s0
+  s2 <- groupE "Stream files" testFiles s1
+  s3 <- groupE "Files and formats" testFormats s2
+  s4 <- groupE "reduce" testReduce s3
+  groupE "Sorting" testSorter s4
+
+-- Checks that fail on the current runtime: a stream file cut short reads as
+-- a shorter stream (compiler model/runtime/issues/streams.md).
+testTruncated :: Results -> <IO> Results
+testTruncated s0 = do
+  r <- tmpPath "cut.mlc"
+  saveSource 0 r numbers
+  truncateFile r 300
+  Ok s6 <- @open r
+  cut <- reduce sumBatch addInts same (@next s6)
+  testTrue "reduce reports a truncated stream file as Err" (isErr cut) s0
+
+knownIssues :: <IO> Bool
+knownIssues = suiteE (groupE "Known runtime issues" testTruncated)

@@ -1,8 +1,0 @@
-module streamTest (foo, search)
-
-import stream (takeS, Stream)
-import string (search)
-import pybase (map, add)
-
-foo :: Int -> Stream Real -> [Real]
-foo i = map (add 1.0) . takeS i

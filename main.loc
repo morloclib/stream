@@ -1,17 +1,401 @@
+--' Streams of batches, the files that hold them, and reductions over them
+--'
+--' Two shapes. A push stream (`Source`) is a function that feeds each batch,
+--' in order, to a sink; text readers produce these, so reading, converting and
+--' writing a traditional format never holds the file in memory. A pull
+--' (`Pull`) is an action that returns the next batch each time it runs
+--' (`@next` on an `IStream`), with `Ok []` at the end and `Err` on a failed
+--' read; morloc stream files are read this way, and `reduce` consumes
+--' pulls. Everything here runs on the calling thread; the parallel module
+--' runs stream stages on worker threads.
+--'
+--' Implementations: stream-rust, stream-cpp, stream-py.
 module stream (*)
 
-import types
+import root
 
-source Py from "stream.py"
-  ( "packStream"
-  , "unpackStream"
-  , "takeS"
-  )
+--' Compression level of a morloc stream file
+--'
+--' 0 to 9; 0 is uncompressed.
+--' Higher levels compress more, more slowly.
+--' The runtime maps a level to a codec preset (now zstd).
+--' @arg --compression-level
+--' @metavar LEVEL
+--' @default 3
+type CompressionLevel = Int
 
-type Py => (Stream a) = "iterator" a
+-- Push streams
+---------------
 
-instance Packable [a] (Stream a) where
-  source Py from "stream.py" ( "packStream" as pack, "unpackStream" as unpack)
+--' A consumer of batches
+type Sink a = [a] -> <IO> ()
 
--- mutates the Stream input
-takeS :: Int -> Stream a -> [a]
+--' A stream that feeds each batch, in order, to a sink
+--'
+--' This is the producer shape `@collect` consumes.
+type Source a = Sink a -> <IO> ()
+
+--' An action that returns the next batch of a stream
+--'
+--' `Ok []` at the end and `Err` on a failed read; `@next` on an `IStream` is
+--' one.
+type Pull a = <IO> (Try Str [a])
+
+
+-- Files and formats
+--------------------
+--
+-- A file is read as a `Source` and written from one, so a pipeline holds
+-- morloc values only and touches a file format at its ends: `ingest` turns a
+-- file into a morloc stream file, `emit` turns one back, and `convert` goes
+-- from file to file. `loadSource` is the reader of morloc stream files and
+-- `saveSource level` their writer.
+
+--' Feeds the values of a file, batch by batch, to a sink
+type Reader a =
+    --' Input file
+    --' @check.path r
+    Str -> Sink a -> <IO> ()
+
+--' Writes the values of a source to a file
+type Writer a =
+    --' Output file
+    --' @check.path w
+    Str -> Source a -> <IO> ()
+
+--' A file format holding values of type `a`
+--'
+--' A format is a tag on the values it holds: `Fasta FastaEntry` is FASTA
+--' read as `FastaEntry`. The tag is a newtype that derives `Packable`, so
+--' `unpackReader` and `packWriter` turn the format's reader and writer into
+--' ones of the untagged values at no cost. The instance is chosen by type:
+--' `readFormat :: Reader (Fasta FastaEntry)`.
+class StreamFormattable a where
+  --' Read from format
+  readFormat :: Reader a
+
+  --' Write to format
+  writeFormat :: Writer a
+
+--' Transform each batch a reader yields
+mapReader :: ([a] -> [b]) -> Reader a -> Reader b
+mapReader f r path sink = r path (\xs -> sink (f xs))
+
+--' Transform each batch before a writer writes it
+comapWriter :: ([b] -> [a]) -> Writer a -> Writer b
+comapWriter f w path src = w path (mapSource f src)
+
+--' A format's reader as a reader of the values it tags
+unpackReader :: Packable a b => Reader b -> Reader a
+unpackReader r path = mapReader (map unpack) r path
+
+--' A format's writer as a writer of the values it tags
+packWriter :: Packable a b => Writer b -> Writer a
+packWriter w path = comapWriter (map pack) w path
+
+--' Read a file with one reader and write it with another
+convert ::
+  Reader a ->
+  Writer a ->
+  --' Input file
+  --' @check.path r
+  Str ->
+  --' Output file
+  --' @check.path w
+  Str ->
+  <IO> ()
+convert r w input output = w output (r input)
+
+--' Convert a file into a morloc stream file
+ingest ::
+  Reader a ->
+  CompressionLevel ->
+  --' Input file
+  --' @check.path r
+  Str ->
+  --' Output morloc stream file
+  --' @check.path w
+  Str ->
+  <IO> ()
+ingest r level input output = convert r (saveSource level) input output
+
+--' Write a morloc stream file in a format
+emit ::
+  Writer a ->
+  --' Morloc stream file
+  --' @check.path r
+  Str ->
+  --' Output file
+  --' @check.path w
+  Str ->
+  <IO> ()
+emit w input output = convert loadSource w input output
+
+
+--' Transform each batch of a stream
+mapSource ::
+  --' Transformation of one batch
+  ([a] -> [b]) ->
+  Source a ->
+  Source b
+mapSource f src sink = src (\xs -> sink (f xs))
+
+--' A list as a stream of one batch
+listSource :: [a] -> Source a
+listSource xs sink = sink xs
+
+--' One stream after another
+concatSources :: [Source a] -> Source a
+concatSources srcs sink = do
+  ? length srcs == 0 = do
+      ()
+  : do
+    let src = .[0] srcs
+    src sink
+    concatSources (.[1:] srcs) sink
+
+--' Fold the batches of a stream into one value, in order
+foldSource ::
+  --' Step: the value so far and the next batch
+  (b -> [a] -> b) ->
+  --' Initial value
+  b ->
+  Source a ->
+  <IO> b
+
+--' Fold a stream with a step that may perform effects
+--'
+--' Like `foldSource`; the step may, say, write each batch somewhere as it
+--' folds it.
+foldSourceE ::
+  --' Step: the value so far and the next batch
+  (b -> [a] -> <IO> b) ->
+  --' Initial value
+  b ->
+  Source a ->
+  <IO> b
+
+--' Every element of a stream, in order, in memory
+collectSource :: Source a -> <IO> [a]
+
+
+-- Morloc stream files
+----------------------
+
+-- There is no `@flush`: flushing each batch makes zstd writes 2.4x slower
+-- (compiler model/runtime/issues/encode-throughput.md).
+
+--' Write a batch to a morloc stream
+writeBatch ::
+  CompressionLevel ->
+  OStream a ->
+  Sink a
+writeBatch level o xs = do
+  Ok _ <- @write level o xs
+  ()
+
+--' Save a stream to a morloc stream file
+--'
+--' Each batch becomes one sub-packet. The file can be read back as a pull
+--' (`@next`) or opened for random access as an `IFile [a]`.
+saveSource ::
+  CompressionLevel ->
+  --' Output file
+  --' @check.path w
+  Str ->
+  Source a ->
+  <IO> ()
+saveSource level path src = do
+  Ok o <- @open path
+  src (writeBatch level o)
+  @close o
+  ()
+
+--' A pull that also writes each batch it returns to a stream
+--'
+--' A reduction over the pull saves its input on the way.
+teePull ::
+  CompressionLevel ->
+  OStream a ->
+  Pull a ->
+  Pull a
+teePull level o pull = do
+  r <- pull
+  match r
+    | (Err e) = do
+        Err e
+    | (Ok xs) = do
+        writeBatch level o xs
+        Ok xs
+
+--' Save every batch of a pull to a morloc stream file
+--'
+--' A failed read is an error.
+savePull ::
+  CompressionLevel ->
+  --' Output file
+  --' @check.path w
+  Str ->
+  Pull a ->
+  <IO> ()
+savePull level path pull = saveSource level path (pullSource pull)
+
+--' Feed the batches of a pull to a sink, in order
+--'
+--' A failed read is an error.
+pullSource :: Pull a -> Source a
+pullSource pull sink = do
+  r <- pull
+  match r
+    | (Err e) = @throw e
+    | (Ok xs) = ? length xs == 0 = do
+          ()
+        : do
+          sink xs
+          pullSource pull sink
+
+--' Feed the batches of a morloc stream to a sink, in order
+drainStream :: IStream a -> Source a
+drainStream s sink = pullSource (@next s) sink
+
+--' Stream a morloc stream file, batch by batch
+loadSource ::
+  --' Morloc stream file
+  --' @check.path r
+  Str ->
+  Source a
+loadSource path sink = do
+  Ok s <- @open path
+  drainStream s sink
+
+
+-- Reductions over pulls
+------------------------
+
+--' Reduce a pull batch by batch with an associative merge
+--'
+--' `summarize` turns one batch into a summary, `merge` combines two
+--' summaries, and `finish` turns the final summary into the result. Batches
+--' are merged in stream order, so `merge` need not commute; it must be
+--' associative, and `summarize []` must be its identity. The summary may
+--' carry state the result does not need (sums for a mean, a sketch for a
+--' quantile); `finish` drops it. A failed read is returned as `Err`. The
+--' parallel module runs the same reduction on worker threads.
+reduce ::
+  --' summarize: one batch to a summary
+  ([a] -> b) ->
+  --' merge: two summaries in stream order
+  (b -> b -> b) ->
+  --' finish: the final summary to the result
+  (b -> c) ->
+  Pull a ->
+  <IO> (Try Str c)
+reduce summarize merge finish pull = do
+  r <- reduceNative summarize merge (pullTriple pull)
+  ? .0 r = Ok (finish (.2 r)) : Err (.1 r)
+
+--' Two reductions in one pass
+reduce2 ::
+  --' First reduction's summarize
+  ([a] -> b1) ->
+  --' First reduction's merge
+  (b1 -> b1 -> b1) ->
+  --' First reduction's finish
+  (b1 -> c1) ->
+  --' Second reduction's summarize
+  ([a] -> b2) ->
+  --' Second reduction's merge
+  (b2 -> b2 -> b2) ->
+  --' Second reduction's finish
+  (b2 -> c2) ->
+  Pull a ->
+  <IO> (Try Str (c1, c2))
+reduce2 s1 m1 f1 s2 m2 f2 pull =
+  reduce
+    (\xs -> (s1 xs, s2 xs))
+    (\x y -> (m1 (.0 x) (.0 y), m2 (.1 x) (.1 y)))
+    (\x -> (f1 (.0 x), f2 (.1 x)))
+    pull
+
+--' The first elements of a pull
+--'
+--' Fewer when the pull ends sooner; the rest of the batch that crosses the
+--' limit is dropped.
+takePull ::
+  --' Elements to keep
+  Int ->
+  Pull a ->
+  <IO> (Try Str [a])
+takePull n pull = do
+  r <- takePullNative n (pullTriple pull)
+  ? .0 r = Ok (.2 r) : Err (.1 r)
+
+--' Adapt a pull to the triple native drivers take
+--'
+--' `Try` is a generated type native code cannot name, so a native driver of a
+--' pull takes it as (ok, error, batch).
+pullTriple :: Pull a -> <IO> (Bool, Str, [a])
+pullTriple pull = do
+  r <- pull
+  match r
+    | (Err e) = (False, e, [])
+    | (Ok xs) = (True, "", xs)
+
+-- The native driver of `reduce`: returns (ok, error, summary).
+reduceNative :: ([a] -> b) -> (b -> b -> b) -> <IO> (Bool, Str, [a]) -> <IO> (Bool, Str, b)
+
+-- The native driver of `takePull`: returns (ok, error, elements).
+takePullNative :: Int -> <IO> (Bool, Str, [a]) -> <IO> (Bool, Str, [a])
+
+
+-- External sorting
+-------------------
+
+--' Open an external sorter of fixed-width records
+--'
+--' Records are compared word by word as unsigned integers. The sorter holds
+--' about the given memory of records and writes the rest as sorted runs to
+--' temporary files in the directory. The run files are removed from the
+--' directory as soon as they are created and live only while the sorter is
+--' open (or until the process ends). Returns a handle.
+openSorter ::
+  --' Directory for the run files
+  --' @check.path rw
+  Str ->
+  --' Record width in U64 words (1 to 4)
+  Int ->
+  --' Memory for records, in KiB
+  Int ->
+  <IO> Int
+
+--' Add records to an open sorter
+--'
+--' Fails when the list does not hold whole records or the sorter is already
+--' being read.
+pushSorter ::
+  --' Sorter handle
+  Int ->
+  --' Records, the sorter's width in words each
+  [U64] ->
+  <IO> ()
+
+--' The sorted records as a pull
+--'
+--' Batches of whole records, ascending, `Ok []` at the end. The first call
+--' ends the input.
+nextSorted ::
+  --' Sorter handle
+  Int ->
+  Pull U64
+nextSorted h = do
+  r <- nextSortedNative h
+  ? .0 r = Ok (.2 r) : Err (.1 r)
+
+-- The native step of `nextSorted`: returns (ok, error, records).
+nextSortedNative :: Int -> <IO> (Bool, Str, [U64])
+
+--' Close a sorter and free its memory and run files
+closeSorter ::
+  --' Sorter handle
+  Int ->
+  <IO> ()
