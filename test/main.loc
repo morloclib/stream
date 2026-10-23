@@ -1,7 +1,7 @@
 --' The stream test suite
 --'
 --' It runs against whichever implementation module is imported alongside it.
-module stream.test (test, knownIssues)
+module stream.test (test, testBelow63, knownIssues)
 
 import root
 import stream
@@ -25,8 +25,8 @@ tmpDir :: Str -> <IO> Str
 --' How many entries a directory holds
 filesIn :: Str -> <IO> Int
 
---' Records of `width` words, with repeats, over the U64 range
-scrambled :: Int -> Int -> Int -> [U64]
+--' Records of `width` words, with repeats, below 2^bits
+scrambled :: Int -> Int -> Int -> Int -> [U64]
 
 --' Records of `width` words sorted as the sorter sorts them
 sortedRecords :: [U64] -> Int -> [U64]
@@ -195,10 +195,11 @@ testReduce s0 = do
   . testNear "reduce of an empty stream finishes the empty summary" 1.0e-12 (okOr 1.0 emptyMean) 0.0
   ) s0
 
-testSorter :: Results -> <IO> Results
-testSorter s0 = do
+-- Sorts words below 2^bits.
+testSorter :: Int -> Results -> <IO> Results
+testSorter bits s0 = do
   d <- tmpDir "sort"
-  let xs = scrambled 5000 3 1
+  let xs = scrambled 5000 3 bits 1
   h1 <- openSorter d 3 1024
   pushSorter h1 xs
   Ok inMemory <- takePull 100000000 (nextSorted h1)
@@ -220,15 +221,21 @@ testSorter s0 = do
   ) s0
 
 test :: <IO> Bool
-test = suiteE runTests
+test = suiteE (runTests 64)
 
-runTests :: Results -> <IO> Results
-runTests s0 = do
+--' The suite with sorter words below 2^63
+--'
+--' For R, which cannot hold a U64 at or above 2^63.
+testBelow63 :: <IO> Bool
+testBelow63 = suiteE (runTests 63)
+
+runTests :: Int -> Results -> <IO> Results
+runTests bits s0 = do
   s1 <- groupE "Push streams" testPush s0
   s2 <- groupE "Stream files" testFiles s1
   s3 <- groupE "Files and formats" testFormats s2
   s4 <- groupE "reduce" testReduce s3
-  groupE "Sorting" testSorter s4
+  groupE "Sorting" (testSorter bits) s4
 
 -- Checks that fail on the current runtime: a stream file cut short reads as
 -- a shorter stream (compiler model/runtime/issues/streams.md).

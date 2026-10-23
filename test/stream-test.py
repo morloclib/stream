@@ -28,11 +28,13 @@ def files_in(d):
     return len(os.listdir(d))
 
 
-def scrambled(n, width, seed):
-    """n records of `width` words with repeats, spanning the u64 range."""
+def scrambled(n, width, bits, seed):
+    """n records of `width` words with repeats, spanning [0, 2^bits)."""
     import random
     rng = random.Random(seed)
-    pool = [rng.randrange(1 << 64) for _ in range(max(1, n // 3))] + [0, (1 << 64) - 1, 1 << 63, (1 << 63) - 1]
+    top = 1 << bits
+    edges = [0, 1, (1 << 32) - 1, 1 << 32, top - 1] + ([1 << 63, (1 << 63) - 1] if bits > 63 else [])
+    pool = [rng.randrange(top) for _ in range(max(1, n // 3))] + edges
     return [rng.choice(pool) for _ in range(n * width)]
 
 
