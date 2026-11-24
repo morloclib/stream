@@ -6,7 +6,6 @@ module stream.test (test, testBelow63, knownIssues)
 import root
 import stream
 import shell (rm)
-import bioutil (mapE_)
 import unittest
 
 source Py from "stream-test.py"
